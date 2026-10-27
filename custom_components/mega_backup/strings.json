@@ -1,0 +1,58 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "MEGA account",
+        "description": "Connect a MEGA account and pick the folder that will hold your Home Assistant backups. The folder is created when it does not exist yet, and nested folders can be separated with a slash.",
+        "data": {
+          "email": "Email address",
+          "password": "Password",
+          "folder": "Backup folder"
+        },
+        "data_description": {
+          "folder": "Folder in the MEGA Cloud Drive, for example `Home Assistant Backups` or `Backups/Home Assistant`."
+        }
+      },
+      "mfa": {
+        "title": "Two-factor authentication",
+        "description": "The MEGA account {email} is protected with two-factor authentication. Enter the current code from your authenticator app.",
+        "data": {
+          "mfa_code": "Authentication code"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate MEGA account",
+        "description": "The stored MEGA session for {email} has expired. Enter the password to log in again.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to MEGA. Check your network connection and try again.",
+      "invalid_auth": "The email address or password is incorrect.",
+      "invalid_folder": "The backup folder could not be created or used.",
+      "invalid_mfa": "The two-factor authentication code was rejected.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This MEGA account is already configured.",
+      "reauth_failed": "Reauthentication failed, the config entry no longer exists.",
+      "reauth_successful": "Reauthentication was successful."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "MEGA Backup options",
+        "description": "Change the folder in the MEGA Cloud Drive that stores your Home Assistant backups.",
+        "data": {
+          "folder": "Backup folder"
+        }
+      }
+    },
+    "error": {
+      "invalid_folder": "The backup folder could not be created or used."
+    }
+  }
+}
