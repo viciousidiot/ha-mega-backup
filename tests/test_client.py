@@ -272,6 +272,7 @@ async def test_upload_download_delete(
             assert node.is_file
             assert node.parent == ROOT_HANDLE
             assert progress[-1] == len(data)
+            assert node.attributes[mega.KEY_LAYOUT_ATTRIBUTE] == mega.KEY_LAYOUT_FOLDED
             assert node.attributes["c"] == mega.b64url_encode(
                 reference_fingerprint_crc(data) + mega._serialize64(1_700_000_000)
             )
@@ -315,6 +316,32 @@ async def test_upload_checks_the_stream_size(
                 )
 
             assert [node for node in fake.nodes.values() if node["t"] == 0] == []
+
+
+@pytest.mark.parametrize("legacy_key_layout", [False, True])
+async def test_download_handles_both_node_key_layouts(
+    monkeypatch: pytest.MonkeyPatch, socket_enabled: None, legacy_key_layout: bool
+) -> None:
+    """Files from 1.0.0/1.0.1 stay restorable while new files use MEGA's layout."""
+    data = bytes(range(256)) * 700
+    async with running_mega() as (fake, url):
+        session, client = await _login(monkeypatch, url, fake.email, fake.password)
+        async with session:
+            handle = fake.add_file(
+                parent=ROOT_HANDLE,
+                name="backup.tar",
+                data=data,
+                legacy_key_layout=legacy_key_layout,
+            )
+            node = await client.async_get_node(handle)
+
+            marker = node.attributes.get(mega.KEY_LAYOUT_ATTRIBUTE)
+            if legacy_key_layout:
+                assert marker is None
+            else:
+                assert marker == mega.KEY_LAYOUT_FOLDED
+
+            assert await _collect(client.async_download_file(node)) == data
 
 
 async def test_quota_errors(

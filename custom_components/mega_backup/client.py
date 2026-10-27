@@ -63,6 +63,13 @@ FINGERPRINT_LANES = 4
 # Arbitrary limit for the JSON files this integration keeps next to backups.
 MAX_METADATA_SIZE = 1024 * 1024
 
+# Node attribute recording how the node key is laid out. Versions 1.0.0 and
+# 1.0.1 stored the raw upload key, which MEGA clients cannot decrypt. New
+# uploads are marked so they can still be told apart from those old files, and
+# MEGA stores the encrypted attributes verbatim.
+KEY_LAYOUT_ATTRIBUTE = "mbk"
+KEY_LAYOUT_FOLDED = 2
+
 API_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=30, sock_read=120)
 TRANSFER_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=30, sock_read=300)
 
@@ -223,6 +230,21 @@ def _node_cipher_key(node_key: bytes) -> bytes:
     if len(node_key) >= 32:
         return _xor(node_key[:16], node_key[16:32])
     return node_key[:16]
+
+
+def _merge_key_mac(file_key: bytes, meta_mac: bytes) -> bytes:
+    """Return the 32 byte node key for a 24 byte upload key and its meta MAC.
+
+    MEGA folds the second half of a 32 byte file key into the first half
+    before using it, so the stored key has to be prepared the same way: the
+    first 16 bytes are XORed with the nonce and the meta MAC. Folding the
+    result again yields the AES key that encrypts the file contents and the
+    attributes.
+    """
+    merged = bytearray(file_key + meta_mac)
+    for index in range(16):
+        merged[index] ^= merged[16 + index]
+    return bytes(merged)
 
 
 def _decode_mpis(data: bytes, count: int = 4) -> list[int]:
@@ -1036,9 +1058,13 @@ class MegaClient:
             return
 
         key = node.key
-        # File contents use the raw key/nonce, while attributes use the
-        # condensed (folded) key handled by _node_cipher_key.
-        aes_key = key[:16]
+        if node.attributes.get(KEY_LAYOUT_ATTRIBUTE) == KEY_LAYOUT_FOLDED:
+            # MEGA uses the folded key for the contents and the attributes.
+            aes_key = _node_cipher_key(key)
+        else:
+            # Backups from 1.0.0 and 1.0.1 stored the raw upload key. They are
+            # broken for MEGA clients, but must stay restorable here.
+            aes_key = key[:16]
         nonce = key[16:24]
         expected_mac = key[24:32] if len(key) >= 32 else b""
         decryptor = Cipher(
@@ -1180,16 +1206,20 @@ class MegaClient:
             raise MegaConnectionError("MEGA did not return the uploaded file handle")
 
         meta_mac = mac.digest()
-        merged_key = upload_key + meta_mac
-        # Attributes are encrypted with the condensed key (the first half of the
-        # merged key XORed with the second half), while the node stores the
-        # unmodified merged key.
-        condensed_key = _xor(merged_key[:16], merged_key[16:32])
+        merged_key = _merge_key_mac(upload_key, meta_mac)
+        # MEGA derives the AES key for both the contents and the attributes by
+        # folding the node key, so the real upload key is the folded key.
+        condensed_key = _node_cipher_key(merged_key)
 
         if mtime is None:
             mtime = int(time.time())
         encrypted_attributes = encrypt_attributes(
-            {"n": name, "c": fingerprint.digest(mtime)}, condensed_key
+            {
+                "n": name,
+                "c": fingerprint.digest(mtime),
+                KEY_LAYOUT_ATTRIBUTE: KEY_LAYOUT_FOLDED,
+            },
+            condensed_key,
         )
         stored_key = aes_ecb_encrypt(self._master_key or b"", merged_key)
 

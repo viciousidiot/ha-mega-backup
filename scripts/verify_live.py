@@ -39,17 +39,20 @@ from types import SimpleNamespace
 from typing import Any
 
 import aiohttp
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from custom_components.mega_backup.backup import MegaBackupAgent
 from custom_components.mega_backup.client import (
+    TRANSFER_TIMEOUT,
     MegaAuthError,
     MegaClient,
     MegaMfaRequired,
     MegaNode,
     MegaSession,
+    _MegaMac,
     b64url_decode,
 )
 
@@ -173,6 +176,42 @@ async def download(node: MegaNode, client: MegaClient) -> bytes:
     return bytes(buffer)
 
 
+async def download_like_mega(
+    node: MegaNode, client: MegaClient, session: aiohttp.ClientSession
+) -> bytes:
+    """Decrypt a node the way the MEGA SDK and the official clients do.
+
+    The SDK folds the second half of the 32 byte node key into the first half
+    and uses that key for the file contents. This deliberately avoids the
+    client's own download path so the on-wire key layout is checked.
+    """
+    assert node.key is not None and len(node.key) >= 32
+    key = node.key
+    aes_key = bytes(left ^ right for left, right in zip(key[:16], key[16:32]))
+    nonce = key[16:24]
+    meta_mac = key[24:32]
+
+    response = await client._api({"a": "g", "g": 1, "n": node.handle})
+    if not isinstance(response, dict) or not isinstance(response.get("g"), str):
+        raise TypeError("MEGA did not return a download URL")
+    size = int(response.get("s", node.size))
+
+    encryptor = Cipher(algorithms.AES(aes_key), modes.CTR(nonce + bytes(8))).encryptor()
+    mac = _MegaMac(aes_key, nonce)
+    buffer = bytearray()
+    async with session.get(
+        f"{response['g']}/0-{size - 1}", timeout=TRANSFER_TIMEOUT
+    ) as download:
+        download.raise_for_status()
+        async for chunk in download.content.iter_any():
+            plain = encryptor.update(chunk)
+            mac.update(plain)
+            buffer.extend(plain)
+    if mac.digest() != meta_mac:
+        raise RuntimeError("meta MAC mismatch with the folded node key")
+    return bytes(buffer)
+
+
 def find_folder(nodes: dict[str, MegaNode], path: str) -> str | None:
     """Return the handle of ``path`` without creating anything."""
     parent = MegaClient._root_handle(nodes)
@@ -255,6 +294,13 @@ async def client_checks(
             digest(downloaded),
             digest(payload),
             "download content matches (MAC verified)",
+        )
+
+        folded = await download_like_mega(children[name], client, session)
+        checks.equal(
+            digest(folded),
+            digest(payload),
+            "official-client key fold decrypts the file",
         )
 
     await client.async_delete_node(node.handle)

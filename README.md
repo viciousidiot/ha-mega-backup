@@ -89,6 +89,15 @@ the fingerprint, MEGA Sync lists the files as **File Fingerprint Missing** and
 refuses to download them, which is why versions before 1.0.1 could not be
 restored outside Home Assistant.
 
+MEGA derives the key for the file contents and the attributes by folding the
+second half of the stored node key into the first half. Version 1.0.2 stores the
+key in exactly that layout and marks new uploads with a `mbk` node attribute.
+Backups uploaded by 1.0.0 and 1.0.1 used the raw upload key instead, so MEGA Sync
+and the mobile apps reported a decryption error for them after their fingerprint
+had been resolved. Home Assistant can still restore those older backups (the
+missing marker selects the old key layout), but they cannot be repaired for the
+MEGA apps; delete them and create new backups with 1.0.2 or later.
+
 ## Limitations
 
 - The MEGA API is a third-party, undocumented API. MEGA can change it at any
@@ -125,8 +134,11 @@ pytest
 ```
 
 The tests start an in-process MEGA API emulator (`tests/fake_mega.py`) that
-validates login hashes, RSA sessions, node key wrapping, chunked AES-CTR uploads
-and meta MACs. No MEGA account or network access is required.
+validates login hashes, RSA sessions, node key wrapping, chunked AES-CTR uploads,
+meta MACs and file fingerprints. No MEGA account or network access is required.
+
+`tests/test_megajs_interop.py` pins the upload crypto (key layout, ciphertext and
+meta MAC) to vectors produced by `megajs` 1.3.10, an independent MEGA client.
 
 On Windows, create the environment with Python 3.14 and set `PYTHONPATH` to
 include small `fcntl`/`resource` shims if the Home Assistant test harness needs

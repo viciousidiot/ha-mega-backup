@@ -253,6 +253,51 @@ class FakeMega:
             if handle not in self.nodes:
                 return handle
 
+    def add_file(
+        self,
+        *,
+        parent: str,
+        name: str,
+        data: bytes,
+        legacy_key_layout: bool = False,
+        mtime: int = 1_700_000_000,
+    ) -> str:
+        """Store a file as if another client had uploaded it."""
+        handle = self._store_handle()
+        upload_key = secrets.token_bytes(24)
+        aes_key, nonce = upload_key[:16], upload_key[16:24]
+        mac = mega._MegaMac(aes_key, nonce)
+        mac.update(data)
+        meta_mac = mac.digest()
+
+        attributes: dict[str, Any] = {"n": name}
+        if legacy_key_layout:
+            node_key = upload_key + meta_mac
+        else:
+            node_key = mega._merge_key_mac(upload_key, meta_mac)
+            attributes[mega.KEY_LAYOUT_ATTRIBUTE] = mega.KEY_LAYOUT_FOLDED
+        attributes["c"] = mega.b64url_encode(
+            reference_fingerprint_crc(data) + mega._serialize64(mtime)
+        )
+
+        encryptor = Cipher(
+            algorithms.AES(aes_key), modes.CTR(mega._ctr_iv(nonce))
+        ).encryptor()
+        self.files[handle] = encryptor.update(data) + encryptor.finalize()
+        self.nodes[handle] = {
+            "h": handle,
+            "p": parent,
+            "t": 0,
+            "ts": mtime,
+            "s": len(data),
+            "a": mega.b64url_encode(
+                mega.encrypt_attributes(attributes, mega._node_cipher_key(node_key))
+            ),
+            "k": f"{self.user_handle}:"
+            + mega.b64url_encode(mega.aes_ecb_encrypt(self.master_key, node_key)),
+        }
+        return handle
+
     # -- API ----------------------------------------------------------------
 
     async def _api(self, request: web.Request) -> web.Response:
@@ -408,7 +453,7 @@ class FakeMega:
     ) -> tuple[bytes, bytes] | None:
         """Verify the meta MAC of an upload and return its plaintext and key."""
         merged = mega.aes_ecb_decrypt(self.master_key, mega.b64url_decode(stored_key))
-        key = merged[:16]
+        key = mega._node_cipher_key(merged)
         nonce = merged[16:24]
         meta_mac = merged[24:32]
 
