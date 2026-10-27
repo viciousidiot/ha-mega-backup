@@ -27,9 +27,11 @@ import hashlib
 import json
 import os
 import secrets
+import struct
 import sys
 import tempfile
 import time
+import zlib
 from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,6 +50,7 @@ from custom_components.mega_backup.client import (
     MegaMfaRequired,
     MegaNode,
     MegaSession,
+    b64url_decode,
 )
 
 try:
@@ -138,6 +141,30 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def reference_fingerprint_crc(data: bytes) -> bytes:
+    """Return MEGA's file fingerprint CRC for ``data`` (independent copy)."""
+    size = len(data)
+    if size <= 16:
+        return data.ljust(16, b"\0")
+    if size <= 8192:
+        return b"".join(
+            struct.pack(
+                ">I", zlib.crc32(data[i * size // 4 : (i + 1) * size // 4]) & 0xFFFFFFFF
+            )
+            for i in range(4)
+        )
+    span = size - 64
+    lanes = []
+    for lane in range(4):
+        value = 0
+        for block in range(32):
+            index = lane * 32 + block
+            offset = min(span * index // 127, span)
+            value = zlib.crc32(data[offset : offset + 64], value)
+        lanes.append(struct.pack(">I", value & 0xFFFFFFFF))
+    return b"".join(lanes)
+
+
 async def download(node: MegaNode, client: MegaClient) -> bytes:
     """Read a node completely through the streaming API."""
     buffer = bytearray()
@@ -192,8 +219,34 @@ async def client_checks(
     checks.equal(node.size, len(payload), "uploaded node reports the right size")
     checks.equal(node.name, name, "uploaded node reports the right name")
 
+    fingerprint = node.attributes.get("c")
+    checks.check(
+        isinstance(fingerprint, str), "uploaded node carries a file fingerprint"
+    )
+    if isinstance(fingerprint, str):
+        raw = b64url_decode(fingerprint)
+        checks.check(
+            len(raw) >= 17 and raw[:16] == reference_fingerprint_crc(payload),
+            "file fingerprint matches the uploaded content",
+        )
+        if len(raw) >= 17:
+            byte_count = raw[16]
+            stored_mtime = int.from_bytes(
+                raw[17 : 17 + byte_count], "little", signed=False
+            )
+            checks.check(
+                abs(stored_mtime - time.time()) < 300,
+                "file fingerprint carries the upload time",
+            )
+
     children = {child.name: child for child in await client.async_list_folder(handle)}
     checks.check(name in children, "uploaded file is listed in the folder")
+    if name in children:
+        checks.equal(
+            children[name].attributes.get("c"),
+            fingerprint,
+            "file fingerprint survives a fresh node listing",
+        )
 
     if name in children:
         downloaded = await download(children[name], client)

@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Callable, Coroutine
+from datetime import datetime
 from typing import Any, override
 
 from homeassistant.components.backup import (
@@ -38,6 +40,15 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _fingerprint_mtime(backup: AgentBackup) -> int:
+    """Return the backup date as a Unix timestamp for MEGA's fingerprint."""
+    try:
+        parsed = datetime.fromisoformat(backup.date)
+    except (TypeError, ValueError):
+        return int(time.time())
+    return int(parsed.timestamp())
 
 
 @callback
@@ -240,6 +251,7 @@ class MegaBackupAgent(BackupAgent):
 
         folder = await self._async_folder()
         filename = suggested_filename(backup)
+        mtime = _fingerprint_mtime(backup)
 
         tar_node: MegaNode | None = None
         try:
@@ -250,6 +262,7 @@ class MegaBackupAgent(BackupAgent):
                 size=backup.size,
                 stream=stream,
                 on_progress=on_progress,
+                mtime=mtime,
             )
             metadata = json.dumps(backup.as_dict()).encode("utf-8")
             await self._client.async_upload_file(
@@ -257,6 +270,7 @@ class MegaBackupAgent(BackupAgent):
                 name=f"{filename}{METADATA_SUFFIX}",
                 size=len(metadata),
                 stream=_single_block(metadata),
+                mtime=mtime,
             )
         except MegaError as err:
             if tar_node is not None:

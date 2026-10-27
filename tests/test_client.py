@@ -6,7 +6,7 @@ from collections.abc import AsyncIterator
 
 import aiohttp
 import pytest
-from fake_mega import ROOT_HANDLE, running_mega
+from fake_mega import ROOT_HANDLE, reference_fingerprint_crc, running_mega
 
 from custom_components.mega_backup import client as mega
 
@@ -264,6 +264,7 @@ async def test_upload_download_delete(
                 size=len(data),
                 stream=_stream(data),
                 on_progress=lambda *, bytes_uploaded: progress.append(bytes_uploaded),
+                mtime=1_700_000_000,
             )
 
             assert node.name == "backup.tar"
@@ -271,6 +272,9 @@ async def test_upload_download_delete(
             assert node.is_file
             assert node.parent == ROOT_HANDLE
             assert progress[-1] == len(data)
+            assert node.attributes["c"] == mega.b64url_encode(
+                reference_fingerprint_crc(data) + mega._serialize64(1_700_000_000)
+            )
 
             downloaded = await _collect(client.async_download_file(node))
             assert downloaded == data

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import AsyncIterator
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
@@ -114,12 +115,17 @@ async def test_upload_list_download_delete(
         assert await _collect(stream) == data
 
         folder = await client.async_resolve_folder(FOLDER)
-        children = await client.async_list_folder(folder)
+        children = {node.name: node for node in await client.async_list_folder(folder)}
         expected_name = suggested_filename(backup)
-        assert {node.name for node in children} == {
+        assert set(children) == {
             expected_name,
             f"{expected_name}.metadata.json",
         }
+        expected_mtime = int(datetime.fromisoformat(backup.date).timestamp())
+        for node in children.values():
+            raw = mega_client.b64url_decode(node.attributes["c"])
+            assert raw[16] == len(raw) - 17
+            assert int.from_bytes(raw[17:], "little") == expected_mtime
 
         await agent.async_delete_backup(backup.backup_id)
 

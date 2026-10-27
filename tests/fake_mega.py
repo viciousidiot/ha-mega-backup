@@ -13,7 +13,9 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import secrets
+import struct
 import time
+import zlib
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -33,6 +35,39 @@ def _mpi(value: int) -> bytes:
     """Encode an integer as a MEGA MPI."""
     bits = value.bit_length()
     return bits.to_bytes(2, "big") + value.to_bytes((bits + 7) // 8, "big")
+
+
+def reference_fingerprint_crc(data: bytes) -> bytes:
+    """Return the CRC half of MEGA's file fingerprint (the ``c`` attribute).
+
+    This is a straightforward, full buffer implementation of MEGA's sparse file
+    fingerprint, used by the emulator to check what the client uploaded.
+    """
+    size = len(data)
+    if size <= mega.FINGERPRINT_CRC_SIZE:
+        return data.ljust(mega.FINGERPRINT_CRC_SIZE, b"\0")
+    if size <= mega.FINGERPRINT_FULL_COVERAGE:
+        return b"".join(
+            struct.pack(
+                ">I",
+                zlib.crc32(data[i * size // 4 : (i + 1) * size // 4]) & 0xFFFFFFFF,
+            )
+            for i in range(mega.FINGERPRINT_LANES)
+        )
+
+    span = size - mega.FINGERPRINT_BLOCK_SIZE
+    denominator = mega.FINGERPRINT_LANES * mega.FINGERPRINT_BLOCKS_PER_LANE - 1
+    lanes = []
+    for lane in range(mega.FINGERPRINT_LANES):
+        value = 0
+        for block in range(mega.FINGERPRINT_BLOCKS_PER_LANE):
+            index = lane * mega.FINGERPRINT_BLOCKS_PER_LANE + block
+            offset = min(span * index // denominator, span)
+            value = zlib.crc32(
+                data[offset : offset + mega.FINGERPRINT_BLOCK_SIZE], value
+            )
+        lanes.append(struct.pack(">I", value & 0xFFFFFFFF))
+    return b"".join(lanes)
 
 
 class FakeMega:
@@ -328,7 +363,11 @@ class FakeMega:
             if entry["t"] == 0:
                 if upload is None or not upload["complete"]:
                     return -9
-                if not self._verify_upload(upload, entry["k"]):
+                decrypted = self._decrypt_upload(upload, entry["k"])
+                if decrypted is None:
+                    return -14
+                plain, merged_key = decrypted
+                if not self._has_valid_fingerprint(entry, plain, merged_key):
                     return -14
             node: dict[str, Any] = {
                 "h": self._store_handle() if entry["t"] == 1 else str(entry["h"]),
@@ -345,8 +384,29 @@ class FakeMega:
             created.append(self._node_payload(node))
         return {"f": created}
 
-    def _verify_upload(self, upload: dict[str, Any], stored_key: str) -> bool:
-        """Verify the meta MAC of an upload against the announced key."""
+    def _has_valid_fingerprint(
+        self, entry: dict[str, Any], plain: bytes, merged_key: bytes
+    ) -> bool:
+        """Check that the node carries a correct ``c`` fingerprint attribute."""
+        condensed_key = mega._xor(merged_key[:16], merged_key[16:32])
+        attributes = mega.decrypt_attributes(
+            mega.b64url_decode(str(entry["a"])), condensed_key
+        )
+        fingerprint = attributes.get("c")
+        if not isinstance(fingerprint, str):
+            return False
+
+        raw = mega.b64url_decode(fingerprint)
+        if len(raw) < mega.FINGERPRINT_CRC_SIZE + 2:
+            return False
+        if raw[mega.FINGERPRINT_CRC_SIZE] != len(raw) - mega.FINGERPRINT_CRC_SIZE - 1:
+            return False
+        return raw[: mega.FINGERPRINT_CRC_SIZE] == reference_fingerprint_crc(plain)
+
+    def _decrypt_upload(
+        self, upload: dict[str, Any], stored_key: str
+    ) -> tuple[bytes, bytes] | None:
+        """Verify the meta MAC of an upload and return its plaintext and key."""
         merged = mega.aes_ecb_decrypt(self.master_key, mega.b64url_decode(stored_key))
         key = merged[:16]
         nonce = merged[16:24]
@@ -358,7 +418,9 @@ class FakeMega:
         ).decryptor()
         plain = decryptor.update(bytes(upload["data"]))
         mac.update(plain)
-        return mac.digest() == meta_mac
+        if mac.digest() != meta_mac:
+            return None
+        return plain, merged
 
     def _upload_url(self, payload: dict[str, Any]) -> dict[str, Any]:
         handle = mega.b64url_encode(secrets.token_bytes(8))

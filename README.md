@@ -82,6 +82,13 @@ file name. This keeps restores working when a file was renamed in the MEGA app.
 Deleting a backup removes both files. Archives without a metadata sidecar (for
 example files uploaded manually to the folder) are ignored and left untouched.
 
+Every uploaded file also carries MEGA's file fingerprint, the `c` member of the
+encrypted node attributes. It is computed while the archive streams past (four
+CRC32 lanes plus the backup date) and MEGA uses it to verify downloads. Without
+the fingerprint, MEGA Sync lists the files as **File Fingerprint Missing** and
+refuses to download them, which is why versions before 1.0.1 could not be
+restored outside Home Assistant.
+
 ## Limitations
 
 - The MEGA API is a third-party, undocumented API. MEGA can change it at any

@@ -28,7 +28,9 @@ import hashlib
 import json
 import logging
 import secrets
+import struct
 import time
+import zlib
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -46,6 +48,17 @@ API_URL = "https://g.api.mega.co.nz/cs"
 CHUNK_START = 128 * 1024
 CHUNK_INCREMENT = 128 * 1024
 CHUNK_MAX = 1024 * 1024
+
+# MEGA stores a fingerprint of each file in the node attributes (the ``c``
+# member). It is four CRC32 lanes over the plaintext, followed by the file's
+# modification time. Files up to 8 KiB are covered completely, larger files are
+# sampled with 128 sparse 64 byte windows. MEGA Sync refuses to download files
+# without a fingerprint ("File Fingerprint Missing").
+FINGERPRINT_CRC_SIZE = 16
+FINGERPRINT_FULL_COVERAGE = 8192
+FINGERPRINT_BLOCK_SIZE = 64
+FINGERPRINT_BLOCKS_PER_LANE = 32
+FINGERPRINT_LANES = 4
 
 # Arbitrary limit for the JSON files this integration keeps next to backups.
 MAX_METADATA_SIZE = 1024 * 1024
@@ -272,6 +285,102 @@ def get_chunks(size: int) -> list[tuple[int, int]]:
     if size > 0:
         chunks.append((offset, size - offset))
     return chunks
+
+
+def _serialize64(value: int) -> bytes:
+    """Serialize a number the way MEGA's ``Serialize64`` does."""
+    value = max(int(value), 0)
+    raw = bytearray()
+    while value:
+        raw.append(value & 0xFF)
+        value >>= 8
+    return bytes([len(raw), *raw])
+
+
+class _FileFingerprint:
+    """Compute MEGA's file fingerprint while the plaintext streams past.
+
+    The result is the value MEGA clients store in the ``c`` member of a node's
+    encrypted attributes. Without it MEGA Sync reports "File Fingerprint
+    Missing" and refuses to download the file.
+    """
+
+    def __init__(self, size: int) -> None:
+        self._size = size
+        self._position = 0
+        if size <= FINGERPRINT_FULL_COVERAGE:
+            # Small files are hashed in full, keep the data around.
+            self._data: bytearray | None = bytearray()
+            self._offsets: list[int] = []
+            self._blocks: list[bytearray] = []
+            return
+
+        span = size - FINGERPRINT_BLOCK_SIZE
+        denominator = FINGERPRINT_LANES * FINGERPRINT_BLOCKS_PER_LANE - 1
+        self._offsets = [
+            min(span * index // denominator, span)
+            for index in range(FINGERPRINT_LANES * FINGERPRINT_BLOCKS_PER_LANE)
+        ]
+        self._blocks = [
+            bytearray(FINGERPRINT_BLOCK_SIZE) for _ in range(len(self._offsets))
+        ]
+        self._data = None
+
+    def update(self, data: bytes) -> None:
+        """Feed the next block of plaintext."""
+        if self._data is not None:
+            self._data.extend(data)
+        else:
+            start = self._position
+            end = start + len(data)
+            for index, offset in enumerate(self._offsets):
+                block_end = offset + FINGERPRINT_BLOCK_SIZE
+                if block_end <= start or offset >= end:
+                    continue
+                source = max(offset, start) - start
+                target = max(offset, start) - offset
+                length = min(block_end, end) - max(offset, start)
+                self._blocks[index][target : target + length] = data[
+                    source : source + length
+                ]
+        self._position += len(data)
+
+    def digest(self, mtime: int) -> str:
+        """Return the base64 encoded fingerprint, including ``mtime``."""
+        if self._position != self._size:
+            raise MegaSizeMismatch(
+                f"Fingerprinted {self._position} bytes, expected {self._size}"
+            )
+
+        if self._data is not None and self._size <= FINGERPRINT_CRC_SIZE:
+            # Tiny files are stored verbatim and zero padded.
+            crc = bytes(self._data).ljust(FINGERPRINT_CRC_SIZE, b"\0")
+        elif self._data is not None:
+            # Small files: four CRC32s over four equally sized parts.
+            crc = b"".join(
+                struct.pack(
+                    ">I",
+                    zlib.crc32(
+                        self._data[
+                            lane * self._size // 4 : (lane + 1) * self._size // 4
+                        ]
+                    )
+                    & 0xFFFFFFFF,
+                )
+                for lane in range(FINGERPRINT_LANES)
+            )
+        else:
+            # Large files: four CRC32s over MEGA's sparse sample windows.
+            lanes = []
+            for lane in range(FINGERPRINT_LANES):
+                value = 0
+                start = lane * FINGERPRINT_BLOCKS_PER_LANE
+                for index in range(start, start + FINGERPRINT_BLOCKS_PER_LANE):
+                    value = zlib.crc32(self._blocks[index], value)
+                lanes.append(struct.pack(">I", value & 0xFFFFFFFF))
+            crc = b"".join(lanes)
+
+        return b64url_encode(crc + _serialize64(mtime))
 
 
 class _MegaMac:
@@ -1001,6 +1110,7 @@ class MegaClient:
         size: int,
         stream: AsyncIterator[bytes],
         on_progress: Callable[..., None] | None = None,
+        mtime: int | None = None,
     ) -> MegaNode:
         """Upload a file and return the created node."""
         response = await self._api(
@@ -1026,6 +1136,7 @@ class MegaClient:
             algorithms.AES(aes_key), modes.CTR(_ctr_iv(nonce))
         ).encryptor()
         mac = _MegaMac(aes_key, nonce)
+        fingerprint = _FileFingerprint(size)
         reader = _BufferedStream(stream)
 
         upload_handle: str | None = None
@@ -1042,6 +1153,7 @@ class MegaClient:
                 )
 
             mac.update(chunk)
+            fingerprint.update(chunk)
             ciphertext = encryptor.update(chunk)
             body = await self._async_upload_chunk(f"{upload_url}/{offset}", ciphertext)
 
@@ -1074,7 +1186,11 @@ class MegaClient:
         # unmodified merged key.
         condensed_key = _xor(merged_key[:16], merged_key[16:32])
 
-        encrypted_attributes = encrypt_attributes({"n": name}, condensed_key)
+        if mtime is None:
+            mtime = int(time.time())
+        encrypted_attributes = encrypt_attributes(
+            {"n": name, "c": fingerprint.digest(mtime)}, condensed_key
+        )
         stored_key = aes_ecb_encrypt(self._master_key or b"", merged_key)
 
         response = await self._api(
